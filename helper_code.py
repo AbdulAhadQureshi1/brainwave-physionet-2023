@@ -32,8 +32,8 @@ def find_recording_files(data_folder, patient_id):
     for file_name in sorted(os.listdir(patient_folder)):
         if not file_name.startswith('.') and file_name.endswith('.hea'):
             root, ext = os.path.splitext(file_name)
-            record_name = '_'.join(root.split('_')[:-1])
-            record_names.add(record_name)
+            if( root.split('_')[-1] == 'EEG' ):
+                record_names.add(root)
     return sorted(record_names)
 
 # Load the WFDB data for the Challenge (but not all possible WFDB files).
@@ -185,7 +185,7 @@ def get_hospital(string):
 
 # Get the age variable (in years) from the patient data.
 def get_age(string):
-    return get_variable(string, 'Age', int)
+    return get_variable(string, 'Age', float)
 
 # Get the sex variable from the patient data.
 def get_sex(string):
@@ -193,7 +193,7 @@ def get_sex(string):
 
 # Get the ROSC variable (in minutes) from the patient data.
 def get_rosc(string):
-    return get_variable(string, 'ROSC', int)
+    return get_variable(string, 'ROSC', float)
 
 # Get the OHCA variable from the patient data.
 def get_ohca(string):
@@ -205,7 +205,7 @@ def get_shockable_rhythm(string):
 
 # Get the TTM variable (in Celsius) from the patient data.
 def get_ttm(string):
-    return get_variable(string, 'TTM', int)
+    return get_variable(string, 'TTM', float)
 
 # Get the Outcome variable from the patient data.
 def get_outcome(string):
