@@ -2,6 +2,7 @@ import os
 import numpy as np
 import wfdb
 from scipy import signal
+import h5py
 
 def read_eeg_for_inference(record_path):
     """Loads EEG signal and returns it with sampling rate."""
@@ -93,8 +94,21 @@ def create_windows(eeg_signal, window_size, fs):
     return eeg_windows[0]
 
 # Example usage for inference
-def preprocess_for_inference(record_path, fs=100, window_size=10):
+def preprocess_for_inference(record_path, fs=100, window_size=300):
     raw_signal, raw_fs = read_eeg_for_inference(record_path)
     processed_signal = preprocess_eeg_signal(raw_signal, raw_fs, fs)
     windows = create_windows(processed_signal, window_size, fs)
-    return windows 
+
+    # Save to disk as h5
+    cache_path = "temp/temp.h5"
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with h5py.File(cache_path, "w") as hf:
+        hf.create_dataset("windows", data=windows, compression="gzip", compression_opts=4)
+    
+    # Read back from h5
+    with h5py.File(cache_path, "r") as hf:
+        compressed_wins = hf["windows"][:]
+        
+    os.remove(cache_path)  # Clean up temporary file
+
+    return compressed_wins

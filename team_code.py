@@ -243,37 +243,38 @@ def get_patient_features(data):
     return features, patient_keys
 
 # Extract features from the EEG data.
-def get_eeg_features(data):
-    means = np.mean(data, axis=1)
-    stds = np.std(data, axis=1)
-    vars_ = np.var(data, axis=1)
-    rms = np.sqrt(np.mean(data ** 2, axis=1))
-    kurt = kurtosis(data, axis=1)
-    power = np.mean(data ** 2, axis=1)
+def get_eeg_features(eeg_windows):
+    """Feature extraction with real PFD and PE"""
+
+    # Ensure batch dimension
+    if len(eeg_windows.shape) == 2:
+        eeg_windows = eeg_windows[np.newaxis, ...]
+    
+    means = np.mean(eeg_windows, axis=(1, 2))
+    stds = np.std(eeg_windows, axis=(1, 2))
+    vars_ = np.var(eeg_windows, axis=(1, 2))
+    rms = np.sqrt(np.mean(eeg_windows ** 2, axis=(1, 2)))
+    kurt = kurtosis(eeg_windows.reshape(eeg_windows.shape[0], -1), axis=1)
+    power = np.mean(eeg_windows ** 2, axis=(1, 2))
     psd_approx = vars_
 
-    # Real PFD and PE
-    pfd_vals = np.array([petrosian_fd(window) for window in data])
-    pe_vals = np.array([perm_entropy(window, normalize=True) for window in data])
+    pfd_vals = np.array([petrosian_fd(window.reshape(-1)) for window in eeg_windows])
+    pe_vals = np.array([perm_entropy(window.reshape(-1), normalize=True) for window in eeg_windows])
 
-    eeg_keys = ["mean", "std", "var", "rms", "kurtosis", "power", "psd", "pfd", "pe"]
-
-    feature_list = []
-    for i in range(data.shape[0]):
-        feature_list.append([
-            float(means[i]),
-            float(stds[i]),
-            float(vars_[i]),
-            float(rms[i]),
-            float(kurt[i]),
-            float(power[i]),
-            float(psd_approx[i]),
-            float(pfd_vals[i]),
-            float(pe_vals[i])
-        ])
-        
-    print(f"feature_list shape= {len(feature_list)}")
-    return feature_list[0], eeg_keys
+    # No need for a loop if just 1 window
+    feature_list = [{
+        "mean": float(means[0]),
+        "std": float(stds[0]),
+        "var": float(vars_[0]),
+        "rms": float(rms[0]),
+        "kurtosis": float(kurt[0]),
+        "power": float(power[0]),
+        "psd": float(psd_approx[0]),
+        "pfd": float(pfd_vals[0]),
+        "pe": float(pe_vals[0])
+    }]
+    
+    return feature_list
 
 # Extract features from the ECG data.
 def get_ecg_features(data):
