@@ -246,6 +246,8 @@ def get_patient_features(data):
 def get_eeg_features(eeg_windows):
     """Feature extraction with real PFD and PE"""
 
+    eeg_feature_names = ["Mean", "Std", "Variance", "RMS", "Kurtosis", "Power", "PSD", "PFD", "PE"]
+
     # Ensure batch dimension
     if len(eeg_windows.shape) == 2:
         eeg_windows = eeg_windows[np.newaxis, ...]
@@ -274,7 +276,7 @@ def get_eeg_features(eeg_windows):
         "pe": float(pe_vals[0])
     }]
     
-    return feature_list
+    return feature_list, eeg_feature_names
 
 # Extract features from the ECG data.
 def get_ecg_features(data):
