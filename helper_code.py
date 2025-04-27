@@ -271,9 +271,9 @@ def save_challenge_outputs(filename, patient_id, outcome, outcome_probability, c
     # Format Challenge outputs.
     patient_string = 'Patient: {}'.format(patient_id)
     if outcome == 0:
-        outcome = 'Good'
-    elif outcome == 1:
         outcome = 'Poor'
+    elif outcome == 1:
+        outcome = 'Good'
     outcome_string = 'Outcome: {}'.format(outcome)
     outcome_probability_string = 'Outcome Probability: {:.3f}'.format(outcome_probability)
     cpc_string = 'CPC: {:.3f}'.format(cast_int_if_int_else_float(cpc))

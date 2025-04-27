@@ -1,0 +1,4 @@
+Patient: 0707
+Outcome: Good
+Outcome Probability: nan
+CPC: 1.000

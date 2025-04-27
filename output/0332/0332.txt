@@ -1,0 +1,4 @@
+Patient: 0332
+Outcome: Good
+Outcome Probability: nan
+CPC: 555.000

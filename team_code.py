@@ -17,9 +17,10 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 import joblib
 from preprocess import preprocess_for_inference
 from scipy.stats import kurtosis
-from scipy import signal
 from antropy import perm_entropy, petrosian_fd
 import pandas as pd
+import torch
+from model import CombinedModel, resnet_config, transformer_config
 
 ################################################################################
 #
@@ -96,8 +97,27 @@ def train_challenge_model(data_folder, model_folder, verbose):
 # Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
 # arguments of this function.
 def load_challenge_models(model_folder, verbose):
-    filename = os.path.join(model_folder, 'models.sav')
-    return joblib.load(filename)
+    # Check if the model folder exists
+    ml_model_path = os.path.join(model_folder, 'ml_models.sav')
+    ml_model = joblib.load(ml_model_path)
+    if verbose:
+        print(f"Loaded ML model from {ml_model_path}")
+
+    # Load DL model
+    dl_model_path = os.path.join(model_folder, 'dl_model.pth')
+    dl_model = CombinedModel(resnet_config, transformer_config)
+    dl_model.load_state_dict(torch.load(dl_model_path))
+    
+    if verbose:
+        print(f"Loaded DL model from {dl_model_path}")
+
+    return {
+        'imputer': ml_model['imputer'],
+        'scaler': ml_model['scaler'],
+        'outcome_model': ml_model['outcome_model'],
+        'cpc_model': ml_model['cpc_model'],
+        'dl_model': dl_model
+    }
 
 # Run your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
 # arguments of this function.
@@ -105,27 +125,58 @@ def run_challenge_models(models, data_folder, patient_id, verbose):
     imputer = models['imputer']
     outcome_model = models['outcome_model']
     cpc_model = models['cpc_model']
+    scaler = models['scaler']
+    dl_model = models['dl_model']
 
-    # Extract features.
-    features = get_features(data_folder, patient_id)
-        
-    # Impute missing data.
+    # Extract features
+    features, dl_outcome_probs = get_features(data_folder, patient_id, dl_model)
+    dl_outcome_probs = np.array([prob[0] for prob in dl_outcome_probs])
+    
+    # Impute and scale
     features = imputer.transform(features)
+    features = scaler.transform(features)
 
-    # Apply models to features.
+    # ML predictions
     outcome = outcome_model.predict(features)
     outcome_probability = outcome_model.predict_proba(features)
     cpc = cpc_model.predict(features)
 
-    # Ensure that the CPC score is between (or equal to) 1 and 5.
-    cpc = np.clip(cpc, 1, 5)
+    # Adjust CPC
+    cpc = np.clip(cpc + 1, 1, 5)
     
-    print(f'outcome= {outcome}')
-    print(f'outcome_probability= {outcome_probability}')
-    print(f'cpc= {cpc}')
+    # Select positive class probabilities
+    ml_positive_probs = outcome_probability[:, 1]
 
-    return outcome, outcome_probability, cpc
+    # Confidence
+    confidence_ml = abs(ml_positive_probs - 0.5)
+    confidence_dl = abs(dl_outcome_probs - 0.5)
 
+    total_confidence = confidence_ml + confidence_dl
+    weight_ml = confidence_ml / total_confidence
+    weight_dl = confidence_dl / total_confidence
+
+    # Final combined probability
+    final_prob = weight_ml * ml_positive_probs + weight_dl * dl_outcome_probs
+
+    # Final binary decision
+    final_outcome = (final_prob >= 0.5).astype(int)
+
+    # Final outcome and cpc
+    final_outcome, cpc = choose_final_outcome_and_cpc(final_outcome, final_prob, cpc)
+
+    if verbose:
+        print(f"DL Model Outcome: {dl_outcome_probs}")
+        print(f'ML Outcome Probability: {ml_positive_probs}')
+        print(f'ML Confidence: {confidence_ml}')
+        print(f'DL Confidence: {confidence_dl}')
+        print(f'Final Combined Probability: {final_prob}')
+        print(f'Final Outcome: {final_outcome}')
+        print(f'CPC: {cpc}')
+        print(f'Final Patient Outcome: {final_outcome}')
+        print(f'Final Patient CPC: {cpc}')
+
+    return final_outcome, final_prob, cpc
+    
 ################################################################################
 #
 # Optional functions. You can change or remove these functions and/or add new functions.
@@ -138,82 +189,66 @@ def save_challenge_model(model_folder, imputer, outcome_model, cpc_model):
     filename = os.path.join(model_folder, 'models.sav')
     joblib.dump(d, filename, protocol=0)
 
-# Preprocess data.
-def preprocess_data(data, sampling_frequency, utility_frequency):
-    # Define the bandpass frequencies.
-    passband = [0.1, 30.0]
+def get_dl_outcome_prob(eeg_data_window, dl_model):
+    dl_model.eval()
+    with torch.no_grad():
+        dl_data = torch.tensor(eeg_data_window, dtype=torch.float32)
+        dl_data = dl_data.unsqueeze(0)  # Add batch dimension
+        dl_output = dl_model(dl_data)
+        dl_outcome_prob = torch.sigmoid(dl_output).numpy()
+        return dl_outcome_prob
 
-    # Promote the data to double precision because these libraries expect double precision.
-    data = np.asarray(data, dtype=np.float64)
-
-    # If the utility frequency is between bandpass frequencies, then apply a notch filter.
-    if utility_frequency is not None and passband[0] <= utility_frequency <= passband[1]:
-        data = mne.filter.notch_filter(data, sampling_frequency, utility_frequency, n_jobs=4, verbose='error')
-
-    # Apply a bandpass filter.
-    data = mne.filter.filter_data(data, sampling_frequency, passband[0], passband[1], n_jobs=4, verbose='error')
-
-    # Resample the data.
-    if sampling_frequency % 2 == 0:
-        resampling_frequency = 128
-    else:
-        resampling_frequency = 125
-    lcm = np.lcm(int(round(sampling_frequency)), int(round(resampling_frequency)))
-    up = int(round(lcm / sampling_frequency))
-    down = int(round(lcm / resampling_frequency))
-    resampling_frequency = sampling_frequency * up / down
-    data = scipy.signal.resample_poly(data, up, down, axis=1)
-
-    # Scale the data to the interval [-1, 1].
-    min_value = np.min(data)
-    max_value = np.max(data)
-    if min_value != max_value:
-        data = 2.0 / (max_value - min_value) * (data - 0.5 * (min_value + max_value))
-    else:
-        data = 0 * data
-
-    return data, resampling_frequency
-
-# Extract features.
-def get_features(data_folder, patient_id):
-    # Load patient metadata.
+def load_patient_data(data_folder, patient_id):
     patient_metadata = load_challenge_data(data_folder, patient_id)
     recording_ids = find_recording_files(data_folder, patient_id)
+    return patient_metadata, recording_ids
 
-    # Extract patient features (single vector).
+def extract_patient_features(patient_metadata):
     patient_features, patient_features_names = get_patient_features(patient_metadata)
+    return patient_features, patient_features_names
 
+def process_single_recording(record_path, sampling_frequency, patient_features, dl_model):
+    eeg_data, eeg_data_window = preprocess_for_inference(record_path, sampling_frequency, window_size=180)
+    dl_outcome_prob = get_dl_outcome_prob(eeg_data_window.T, dl_model)
+    eeg_features, eeg_feature_names = get_eeg_features(eeg_data)
+    combined_features = eeg_features + patient_features
+    return combined_features, eeg_feature_names, dl_outcome_prob
+
+def get_features(data_folder, patient_id, dl_model):
+    # Load data
+    patient_metadata, recording_ids = load_patient_data(data_folder, patient_id)
+    patient_features, patient_features_names = extract_patient_features(patient_metadata)
+
+    dl_outcome_probs = []
     total_features = []
-    full_feature_names = None  # We'll define it once inside the loop
+    full_feature_names = None
 
-    # Loop through each recording
+    sampling_frequency = 100  # Hz
+
     for recording_id in recording_ids:
         print(f'Extracting features from {recording_id}...')
-        
-        # Preprocess EEG data
-        sampling_frequency = 100  # Hz
         record_path = os.path.join(data_folder, patient_id, recording_id)
-        eeg_data = preprocess_for_inference(record_path, sampling_frequency, window_size=180)
+
+        try:
+            combined_features, eeg_feature_names, dl_outcome_prob = process_single_recording(
+                record_path, sampling_frequency, patient_features, dl_model
+            )
+        except Exception as e:
+            print(f"Error processing {record_path}: {e}")
+            continue
+
+        dl_outcome_probs.append(dl_outcome_prob)
         
-        # Extract EEG features
-        eeg_features, eeg_feature_names = get_eeg_features(eeg_data)
+        if combined_features is not None:
+            total_features.append(combined_features)
 
-        # Combine EEG + Patient features
-        combined_features = eeg_features + patient_features
-        total_features.append(combined_features)
+            if full_feature_names is None:
+                full_feature_names = eeg_feature_names + patient_features_names
 
-        # Set column names if not already set
-        if full_feature_names is None:
-            full_feature_names = eeg_feature_names + patient_features_names
-
-    # Create DataFrame
     full_features_df = pd.DataFrame(total_features, columns=full_feature_names)
-
-    # Make sure all values are numeric (convert non-numeric to NaN)
     full_features_df = full_features_df.apply(pd.to_numeric, errors='coerce')
 
-    print(full_features_df.head())
-    return full_features_df
+    return full_features_df, dl_outcome_probs
 
 # Extract patient features from the data.
 def get_patient_features(data):
@@ -246,7 +281,7 @@ def get_patient_features(data):
 def get_eeg_features(eeg_windows):
     """Feature extraction with real PFD and PE"""
 
-    eeg_feature_names = ["Mean", "Std", "Variance", "RMS", "Kurtosis", "Power", "PSD", "PFD", "PE"]
+    eeg_feature_names = ["mean", "std", "var", "rms", "kurtosis", "power", "psd", "pfd", "pe"]
 
     # Ensure batch dimension
     if len(eeg_windows.shape) == 2:
@@ -264,34 +299,41 @@ def get_eeg_features(eeg_windows):
     pe_vals = np.array([perm_entropy(window.reshape(-1), normalize=True) for window in eeg_windows])
 
     # No need for a loop if just 1 window
-    feature_list = [{
-        "mean": float(means[0]),
-        "std": float(stds[0]),
-        "var": float(vars_[0]),
-        "rms": float(rms[0]),
-        "kurtosis": float(kurt[0]),
-        "power": float(power[0]),
-        "psd": float(psd_approx[0]),
-        "pfd": float(pfd_vals[0]),
-        "pe": float(pe_vals[0])
-    }]
+    feature_list = [
+        float(means[0]),
+        float(stds[0]),
+        float(vars_[0]),
+        float(rms[0]),
+        float(kurt[0]),
+        float(power[0]),
+        float(psd_approx[0]),
+        float(pfd_vals[0]),
+        float(pe_vals[0])
+    ]
     
     return feature_list, eeg_feature_names
 
-# Extract features from the ECG data.
-def get_ecg_features(data):
-    num_channels, num_samples = np.shape(data)
 
-    if num_samples > 0:
-        mean = np.mean(data, axis=1)
-        std  = np.std(data, axis=1)
-    elif num_samples == 1:
-        mean = np.mean(data, axis=1)
-        std  = float('nan') * np.ones(num_channels)
+def choose_final_outcome_and_cpc(final_outcome, final_prob, cpc_preds):
+    # Majority voting for outcome
+    # counts = np.bincount(final_outcome)
+    # final_patient_outcome = np.argmax(counts)
+    final_patient_outcome = int(np.round(np.mean(final_outcome)))
+
+    # Split CPCs
+    if final_patient_outcome == 1:
+        valid_cpcs = [1, 2]
     else:
-        mean = float('nan') * np.ones(num_channels)
-        std = float('nan') * np.ones(num_channels)
+        valid_cpcs = [3, 4, 5]
 
-    features = np.array((mean, std)).T
+    cpc_preds = np.round(cpc_preds).astype(int)  # Ensure CPCs are integers
+    matching_cpcs = [cpc for cpc in cpc_preds if cpc in valid_cpcs]
 
-    return features
+    if matching_cpcs:
+        # Pick most common among matching CPCs
+        final_patient_cpc = int(np.round(np.median(matching_cpcs)))
+    else:
+        # No matching CPCs, fallback to most common CPC overall
+        final_patient_cpc = int(np.round(np.median(cpc_preds)))
+
+    return final_patient_outcome, final_patient_cpc
