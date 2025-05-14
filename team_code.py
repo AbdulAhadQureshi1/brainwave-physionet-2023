@@ -30,69 +30,153 @@ from model import CombinedModel, resnet_config, transformer_config
 
 # Train your model.
 def train_challenge_model(data_folder, model_folder, verbose):
-    # Find data files.
-    if verbose >= 1:
-        print('Finding the Challenge data...')
+    os.makedirs(model_folder, exist_ok=True)
+    train_dl_model(data_folder, model_folder, verbose)
+    train_ml_model(data_folder, model_folder, verbose)
+
+def train_dl_model(data_folder, model_folder, verbose):
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader
+    from tqdm import tqdm
+    from model import CombinedModel, resnet_config, transformer_config
+    from preprocess import preprocess_for_inference
+    from helper_code import find_data_folders, load_challenge_data, get_outcome, find_recording_files
+
+    model = CombinedModel(resnet_config, transformer_config)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.5]).to(device))
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    epochs = 5
+    batch_size = 16
 
     patient_ids = find_data_folders(data_folder)
-    num_patients = len(patient_ids)
+    all_inputs, all_labels = [], []
 
-    if num_patients==0:
-        raise FileNotFoundError('No data was provided.')
+    if verbose:
+        print("Preparing data for DL training...")
 
-    # Create a folder for the model if it does not already exist.
-    os.makedirs(model_folder, exist_ok=True)
+    for patient_id in tqdm(patient_ids, desc="DL - Patients"):
+        try:
+            metadata = load_challenge_data(data_folder, patient_id)
+            label = get_outcome(metadata)
+            recording_ids = find_recording_files(data_folder, patient_id)
 
-    # Extract the features and labels.
-    if verbose >= 1:
-        print('Extracting features and labels from the Challenge data...')
+            for recording_id in recording_ids:
+                record_path = os.path.join(data_folder, patient_id, recording_id)
+                try:
+                    _, eeg_window = preprocess_for_inference(record_path, fs=100, window_size=20)
+                    eeg_tensor = torch.tensor(eeg_window.T, dtype=torch.float32).unsqueeze(0)
+                    all_inputs.append(eeg_tensor)
+                    all_labels.append(torch.tensor([label], dtype=torch.float32))
+                except:
+                    continue
+        except:
+            continue
 
-    features = list()
-    outcomes = list()
-    cpcs = list()
+    if not all_inputs:
+        raise ValueError("No valid EEG data found for DL model training.")
 
-    for i in range(num_patients):
-        if verbose >= 2:
-            print('    {}/{}...'.format(i+1, num_patients))
+    inputs_tensor = torch.cat(all_inputs, dim=0)
+    labels_tensor = torch.cat(all_labels, dim=0)
 
-        current_features = get_features(data_folder, patient_ids[i])
-        features.append(current_features)
+    dataset = torch.utils.data.TensorDataset(inputs_tensor, labels_tensor)
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
 
-        # Extract labels.
-        patient_metadata = load_challenge_data(data_folder, patient_ids[i])
-        current_outcome = get_outcome(patient_metadata)
-        outcomes.append(current_outcome)
-        current_cpc = get_cpc(patient_metadata)
-        cpcs.append(current_cpc)
+    model.train()
+    for epoch in range(epochs):
+        running_loss = 0.0
+        for inputs, labels in tqdm(train_loader, desc=f"DL Epoch {epoch+1}"):
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
 
-    features = np.vstack(features)
-    outcomes = np.vstack(outcomes)
-    cpcs = np.vstack(cpcs)
+        if verbose:
+            print(f"Epoch {epoch+1}: Loss = {running_loss / len(train_loader):.4f}")
 
-    # Train the models.
-    if verbose >= 1:
-        print('Training the Challenge model on the Challenge data...')
+    model_path = os.path.join(model_folder, 'dl_model.pth')
+    torch.save(model.state_dict(), model_path)
+    if verbose:
+        print(f"DL model saved to {model_path}")
 
-    # Define parameters for random forest classifier and regressor.
-    n_estimators   = 123  # Number of trees in the forest.
-    max_leaf_nodes = 456  # Maximum number of leaf nodes in each tree.
-    random_state   = 789  # Random state; set for reproducibility.
+def train_ml_model(data_folder, model_folder, verbose):
+    import pandas as pd
+    import numpy as np
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+    import joblib
+    from tqdm import tqdm
 
-    # Impute any missing features; use the mean value by default.
+    from helper_code import (
+        find_data_folders, load_challenge_data, get_outcome, get_cpc, find_recording_files
+    )
+    from preprocess import preprocess_for_inference
+
+    if verbose:
+        print("Extracting features for ML training...")
+
+    features, outcomes, cpcs = [], [], []
+    patient_ids = find_data_folders(data_folder)
+
+    for patient_id in tqdm(patient_ids, desc="ML - Patients"):
+        try:
+            metadata = load_challenge_data(data_folder, patient_id)
+            label = get_outcome(metadata)
+            cpc = get_cpc(metadata)
+            patient_feats, _ = get_patient_features(metadata)
+            recording_ids = find_recording_files(data_folder, patient_id)
+
+            for recording_id in recording_ids:
+                record_path = os.path.join(data_folder, patient_id, recording_id)
+                try:
+                    eeg_data, _ = preprocess_for_inference(record_path, fs=100, window_size=20)
+                    eeg_feats, _ = get_eeg_features(eeg_data)
+                    full_feats = eeg_feats + patient_feats
+                    features.append(full_feats)
+                    outcomes.append(label)
+                    cpcs.append(cpc)
+                except:
+                    continue
+        except:
+            continue
+
+    if not features:
+        raise ValueError("No ML features extracted.")
+
+    features = pd.DataFrame(features).apply(pd.to_numeric, errors='coerce')
+    outcomes = np.array(outcomes).reshape(-1, 1)
+    cpcs = np.array(cpcs).reshape(-1, 1)
+
     imputer = SimpleImputer().fit(features)
+    features_imputed = imputer.transform(features)
 
-    # Train the models.
-    features = imputer.transform(features)
-    outcome_model = RandomForestClassifier(
-        n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, outcomes.ravel())
-    cpc_model = RandomForestRegressor(
-        n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, cpcs.ravel())
+    scaler = StandardScaler().fit(features_imputed)
+    features_scaled = scaler.transform(features_imputed)
 
-    # Save the models.
-    save_challenge_model(model_folder, imputer, outcome_model, cpc_model)
+    clf = RandomForestClassifier(n_estimators=100, max_leaf_nodes=200, random_state=42)
+    clf.fit(features_scaled, outcomes.ravel())
 
-    if verbose >= 1:
-        print('Done.')
+    reg = RandomForestRegressor(n_estimators=100, max_leaf_nodes=200, random_state=42)
+    reg.fit(features_scaled, cpcs.ravel())
+
+    ml_model_path = os.path.join(model_folder, 'ml_models.sav')
+    joblib.dump({
+        'imputer': imputer,
+        'scaler': scaler,
+        'outcome_model': clf,
+        'cpc_model': reg
+    }, ml_model_path, protocol=0)
+
+    if verbose:
+        print(f"ML models saved to {ml_model_path}")
 
 # Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
 # arguments of this function.
